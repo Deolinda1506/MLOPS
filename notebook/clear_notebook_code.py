@@ -1,0 +1,461 @@
+# =============================================================================
+# LUNG CANCER CLASSIFICATION - JUPYTER NOTEBOOK CODE
+# =============================================================================
+# Copy and paste each cell into your Jupyter notebook
+# =============================================================================
+
+# =============================================================================
+# CELL 1: IMPORTS AND SETUP
+# =============================================================================
+
+import os
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+import cv2
+from tqdm import tqdm
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, models, optimizers, callbacks
+from tensorflow.keras.applications import EfficientNetB0, ResNet50V2
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.preprocessing import LabelEncoder
+import json
+from datetime import datetime
+
+# Add src to path
+sys.path.append('../src')
+
+# Import our custom modules
+from preprocessing import DataPreprocessor
+from model import LungCancerClassifier
+from prediction import PredictionService
+
+# Suppress warnings
+warnings.filterwarnings('ignore')
+
+# Set random seeds for reproducibility
+np.random.seed(42)
+tf.random.set_seed(42)
+
+print("✅ All imports successful!")
+
+# =============================================================================
+# CELL 2: DATASET EXPLORATION
+# =============================================================================
+
+print("🔍 EXPLORING DATASET STRUCTURE")
+print("=" * 50)
+
+# Check dataset structure
+data_path = "../data"
+print(f"Data path: {data_path}")
+
+# List all directories
+for split in ['train', 'test', 'valid']:
+    split_path = os.path.join(data_path, split)
+    if os.path.exists(split_path):
+        print(f"\n{split.upper()} directory:")
+        classes = os.listdir(split_path)
+        for class_name in classes:
+            class_path = os.path.join(split_path, class_name)
+            if os.path.isdir(class_path):
+                images = [f for f in os.listdir(class_path) 
+                         if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                print(f"  📁 {class_name}: {len(images)} images")
+    else:
+        print(f"\n{split.upper()} directory not found")
+
+# =============================================================================
+# CELL 3: DATA LOADING AND PREPROCESSING
+# =============================================================================
+
+print("\n📊 LOADING AND PREPROCESSING DATA")
+print("=" * 50)
+
+# Initialize preprocessor
+preprocessor = DataPreprocessor(data_path="../data", img_size=(224, 224))
+
+# Load data from splits
+print("Loading data from splits...")
+
+# Load training data
+print("Loading training data...")
+train_images, train_labels, class_names = preprocessor.load_data_from_split('train')
+
+# Load validation data
+print("Loading validation data...")
+val_images, val_labels, _ = preprocessor.load_data_from_split('valid')
+
+# Load test data
+print("Loading test data...")
+test_images, test_labels, _ = preprocessor.load_data_from_split('test')
+
+# Combine for analysis
+images = np.concatenate([train_images, val_images, test_images])
+labels = np.concatenate([train_labels, val_labels, test_labels])
+
+print(f"\n📊 DATASET SUMMARY:")
+print(f"Training images: {len(train_images)}")
+print(f"Validation images: {len(val_images)}")
+print(f"Test images: {len(test_images)}")
+print(f"Total images: {len(images)}")
+print(f"Classes: {class_names}")
+print(f"Image shape: {images[0].shape}")
+
+# =============================================================================
+# CELL 4: DATA VISUALIZATION
+# =============================================================================
+
+print("\n📈 DATA VISUALIZATION")
+print("=" * 50)
+
+# Create figure with subplots
+fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+
+# 1. Class Distribution
+class_counts = pd.Series(labels).value_counts()
+axes[0, 0].bar(class_counts.index, class_counts.values, color='skyblue')
+axes[0, 0].set_title('Class Distribution (All Data)', fontsize=14, fontweight='bold')
+axes[0, 0].set_xlabel('Classes')
+axes[0, 0].set_ylabel('Number of Images')
+axes[0, 0].tick_params(axis='x', rotation=45)
+
+# Add value labels on bars
+for i, v in enumerate(class_counts.values):
+    axes[0, 0].text(i, v + 10, str(v), ha='center', fontweight='bold')
+
+# 2. Split Distribution
+split_counts = {
+    'Train': len(train_images),
+    'Validation': len(val_images),
+    'Test': len(test_images)
+}
+axes[0, 1].pie(split_counts.values(), labels=split_counts.keys(), autopct='%1.1f%%', 
+               colors=['lightgreen', 'lightcoral', 'lightblue'])
+axes[0, 1].set_title('Data Split Distribution', fontsize=14, fontweight='bold')
+
+# 3. Sample Images
+sample_images = []
+sample_labels = []
+for class_name in class_names:
+    class_indices = np.where(labels == class_name)[0]
+    if len(class_indices) > 0:
+        sample_idx = class_indices[0]
+        sample_images.append(images[sample_idx])
+        sample_labels.append(class_name)
+
+# Display sample images
+for i, (img, label) in enumerate(zip(sample_images, sample_labels)):
+    row = i // 2
+    col = i % 2
+    if row < 2 and col < 2:
+        axes[1, col].imshow(img)
+        axes[1, col].set_title(f'Sample: {label}', fontsize=12)
+        axes[1, col].axis('off')
+
+plt.tight_layout()
+plt.show()
+
+# =============================================================================
+# CELL 5: DATA PREPARATION
+# =============================================================================
+
+print("\n🔧 DATA PREPARATION")
+print("=" * 50)
+
+# Use pre-split data
+X_train, y_train = train_images, train_labels
+X_val, y_val = val_images, val_labels
+X_test, y_test = test_images, test_labels
+
+print(f"📊 DATA SPLIT SUMMARY:")
+print(f"Training set: {X_train.shape[0]} images")
+print(f"Validation set: {X_val.shape[0]} images")
+print(f"Test set: {X_test.shape[0]} images")
+
+# Verify class distribution
+print(f"\n📊 CLASS DISTRIBUTION:")
+print(f"Training: {dict(zip(*np.unique(y_train, return_counts=True)))}")
+print(f"Validation: {dict(zip(*np.unique(y_val, return_counts=True)))}")
+print(f"Test: {dict(zip(*np.unique(y_test, return_counts=True)))}")
+
+# Create data generators with augmentation
+print("\n🔧 Creating data generators...")
+train_generator, val_generator = preprocessor.create_data_generators(
+    X_train, y_train, X_val, y_val, batch_size=32
+)
+
+print("✅ Data generators created successfully!")
+print(f"Training batches per epoch: {len(train_generator)}")
+print(f"Validation batches per epoch: {len(val_generator)}")
+
+# =============================================================================
+# CELL 6: MODEL CREATION
+# =============================================================================
+
+print("\n🤖 MODEL CREATION")
+print("=" * 50)
+
+# Initialize classifier
+num_classes = len(class_names)
+print(f"Number of classes: {num_classes}")
+
+classifier = LungCancerClassifier(
+    num_classes=num_classes,
+    img_size=(224, 224),
+    model_type='efficientnet'  # or 'resnet'
+)
+
+# Build model with optimal settings
+model = classifier.build_model(
+    learning_rate=0.001,
+    dropout_rate=0.5,
+    l2_reg=0.01
+)
+
+print("✅ Model created successfully!")
+print(f"Model parameters: {model.count_params():,}")
+print(f"Input shape: {model.input_shape}")
+print(f"Output shape: {model.output_shape}")
+
+# Display model summary
+model.summary()
+
+# =============================================================================
+# CELL 7: MODEL TRAINING
+# =============================================================================
+
+print("\n🚀 MODEL TRAINING")
+print("=" * 50)
+
+# Train the model
+print("Starting training...")
+history = classifier.train_model(
+    train_generator, 
+    val_generator, 
+    epochs=50,
+    early_stopping_patience=10,
+    reduce_lr_patience=5
+)
+
+print("✅ Training completed!")
+
+# =============================================================================
+# CELL 8: TRAINING VISUALIZATION
+# =============================================================================
+
+print("\n📈 TRAINING VISUALIZATION")
+print("=" * 50)
+
+# Plot training history
+classifier.plot_training_history()
+
+# =============================================================================
+# CELL 9: MODEL EVALUATION
+# =============================================================================
+
+print("\n📊 MODEL EVALUATION")
+print("=" * 50)
+
+# Evaluate on test set
+print("Evaluating model on test set...")
+test_generator, _ = preprocessor.create_data_generators(
+    X_test, y_test, X_test, y_test, batch_size=32
+)
+
+# Get predictions
+y_pred_proba = model.predict(test_generator)
+y_pred = np.argmax(y_pred_proba, axis=1)
+y_true = np.argmax(test_generator.labels, axis=1)
+
+# Calculate metrics
+accuracy = accuracy_score(y_true, y_pred)
+print(f"Test Accuracy: {accuracy:.4f}")
+
+# Classification report
+print("\n📊 CLASSIFICATION REPORT:")
+print(classification_report(y_true, y_pred, target_names=class_names))
+
+# Confusion matrix
+cm = confusion_matrix(y_true, y_pred)
+classifier.plot_confusion_matrix(cm, class_names)
+
+# =============================================================================
+# CELL 10: MODEL SAVING
+# =============================================================================
+
+print("\n💾 MODEL SAVING")
+print("=" * 50)
+
+# Create models directory if it doesn't exist
+os.makedirs('models', exist_ok=True)
+
+# Save model
+model_path = 'models/lung_cancer_model.h5'
+classifier.save_model(model_path)
+print(f"✅ Model saved to: {model_path}")
+
+# Save training results
+results = {
+    'accuracy': float(accuracy),
+    'class_names': class_names,
+    'training_date': datetime.now().isoformat(),
+    'model_parameters': model.count_params(),
+    'dataset_info': {
+        'train_samples': len(X_train),
+        'val_samples': len(X_val),
+        'test_samples': len(X_test),
+        'total_samples': len(images)
+    }
+}
+
+results_path = 'models/training_results.json'
+classifier.save_training_results(results, results_path)
+print(f"✅ Training results saved to: {results_path}")
+
+# =============================================================================
+# CELL 11: PREDICTION TESTING
+# =============================================================================
+
+print("\n🔮 PREDICTION TESTING")
+print("=" * 50)
+
+# Initialize prediction service
+prediction_service = PredictionService(model_path=model_path)
+
+# Test with a few sample images
+print("Testing predictions with sample images...")
+for i in range(min(5, len(X_test))):
+    # Get sample image
+    sample_image = X_test[i]
+    true_label = y_test[i]
+    
+    # Make prediction
+    prediction, confidence = prediction_service.predict_single(sample_image)
+    
+    print(f"Sample {i+1}:")
+    print(f"  True: {true_label}")
+    print(f"  Predicted: {prediction}")
+    print(f"  Confidence: {confidence:.4f}")
+    print()
+
+# =============================================================================
+# CELL 12: FEATURE ANALYSIS
+# =============================================================================
+
+print("\n🔍 FEATURE ANALYSIS")
+print("=" * 50)
+
+# Get feature maps from the model
+feature_model = tf.keras.Model(
+    inputs=model.input,
+    outputs=model.get_layer('global_average_pooling2d').output
+)
+
+# Extract features for a few samples
+sample_features = []
+sample_labels = []
+
+for i in range(min(100, len(X_test))):
+    features = feature_model.predict(X_test[i:i+1])
+    sample_features.append(features.flatten())
+    sample_labels.append(y_test[i])
+
+sample_features = np.array(sample_features)
+
+# PCA for dimensionality reduction
+from sklearn.decomposition import PCA
+
+pca = PCA(n_components=2)
+features_2d = pca.fit_transform(sample_features)
+
+# Plot feature space
+plt.figure(figsize=(10, 8))
+for i, class_name in enumerate(class_names):
+    class_indices = [j for j, label in enumerate(sample_labels) if label == class_name]
+    if class_indices:
+        plt.scatter(features_2d[class_indices, 0], features_2d[class_indices, 1], 
+                   label=class_name, alpha=0.7)
+
+plt.title('Feature Space Visualization (PCA)', fontsize=14, fontweight='bold')
+plt.xlabel('Principal Component 1')
+plt.ylabel('Principal Component 2')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.show()
+
+print("✅ Feature analysis completed!")
+
+# =============================================================================
+# CELL 13: CONFIDENCE ANALYSIS
+# =============================================================================
+
+print("\n📊 CONFIDENCE ANALYSIS")
+print("=" * 50)
+
+# Analyze prediction confidence
+confidences = np.max(y_pred_proba, axis=1)
+
+plt.figure(figsize=(12, 5))
+
+# Confidence distribution
+plt.subplot(1, 2, 1)
+plt.hist(confidences, bins=20, alpha=0.7, color='skyblue', edgecolor='black')
+plt.title('Prediction Confidence Distribution', fontweight='bold')
+plt.xlabel('Confidence')
+plt.ylabel('Frequency')
+plt.grid(True, alpha=0.3)
+
+# Confidence vs accuracy
+plt.subplot(1, 2, 2)
+correct_predictions = (y_pred == y_true)
+plt.scatter(confidences, correct_predictions, alpha=0.6, color='green')
+plt.title('Confidence vs Prediction Accuracy', fontweight='bold')
+plt.xlabel('Confidence')
+plt.ylabel('Correct Prediction (1=Yes, 0=No)')
+plt.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# Calculate confidence statistics
+print(f"Average confidence: {np.mean(confidences):.4f}")
+print(f"Confidence for correct predictions: {np.mean(confidences[correct_predictions]):.4f}")
+print(f"Confidence for incorrect predictions: {np.mean(confidences[~correct_predictions]):.4f}")
+
+# =============================================================================
+# CELL 14: FINAL SUMMARY
+# =============================================================================
+
+print("\n🎉 FINAL SUMMARY")
+print("=" * 50)
+
+print("✅ LUNG CANCER CLASSIFICATION COMPLETED!")
+print(f"\n📊 MODEL PERFORMANCE:")
+print(f"Test Accuracy: {accuracy:.4f}")
+print(f"Number of Classes: {num_classes}")
+print(f"Classes: {class_names}")
+print(f"Model Parameters: {model.count_params():,}")
+
+print(f"\n📁 SAVED FILES:")
+print(f"Model: {model_path}")
+print(f"Results: {results_path}")
+
+print(f"\n📊 DATASET STATISTICS:")
+print(f"Training samples: {len(X_train)}")
+print(f"Validation samples: {len(X_val)}")
+print(f"Test samples: {len(X_test)}")
+print(f"Total samples: {len(images)}")
+
+print("\n🚀 NEXT STEPS:")
+print("1. Use the saved model for predictions")
+print("2. Deploy the model via API")
+print("3. Create a web interface")
+print("4. Monitor model performance")
+
+print("\n🎯 MODEL IS READY FOR DEPLOYMENT!") 
